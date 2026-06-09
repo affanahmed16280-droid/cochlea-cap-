@@ -1,103 +1,104 @@
-/*
-  Cochlea Cap — Receiver Unit
-  Hardware: ESP32 NodeMCU + 4x vibration motors (via 2N2222 transistors)
-  Role: Receives direction from sender via ESP-NOW, fires matching motor
-
-  Wiring (per motor):
-    GPIO → 1kΩ → 2N2222 base
-    2N2222 collector → motor − terminal
-    Motor + terminal → 3.3V
-    1N4148 flyback diode across motor (cathode to 3.3V, anode to collector)
-    2N2222 emitter → GND
-*/
-
+#include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
 
-// ── Motor GPIO pins ───────────────────────────────────────────────────────────
-#define MOTOR_FRONT 16
-#define MOTOR_RIGHT 17
-#define MOTOR_BACK  18
-#define MOTOR_LEFT  19
+// PIN DEFINITIONS
+#define MIC_FRONT  34
+#define MIC_BACK   35
+#define MIC_LEFT   32
+#define MIC_RIGHT  33
 
-// ── Direction constants ───────────────────────────────────────────────────────
-#define DIR_FRONT 0
-#define DIR_RIGHT 1
-#define DIR_BACK  2
-#define DIR_LEFT  3
+// SETTINGS
+#define SAMPLE_WINDOW    50    // Microseconds between samples
+#define SAMPLE_COUNT     100   // Samples per reading
+#define THRESHOLD        300   // Sensitivity (Adjust this based on Serial Monitor)
+#define LOCKOUT_TIME     1000  // Delay after trigger (ms)
 
-// ── Buzz duration (should match sender LOCKOUT_MS) ────────────────────────────
-#define BUZZ_MS 600
+// RECEIVER MAC ADDRESS
+uint8_t receiverAddress[] = {0x00, 0x70, 0x07, 0x7E, 0x73, 0x98};
 
-// ── Motor pin lookup ──────────────────────────────────────────────────────────
-int motorPins[4] = {MOTOR_FRONT, MOTOR_RIGHT, MOTOR_BACK, MOTOR_LEFT};
-const char* dirNames[4] = {"FRONT", "RIGHT", "BACK", "LEFT"};
+typedef struct struct_message {
+    uint8_t direction; // 0:FRONT, 1:BACK, 2:LEFT, 3:RIGHT
+} struct_message;
 
-// ── Buzz task — runs on a separate FreeRTOS task so loop() stays free ─────────
-struct BuzzParams {
-  int pin;
-};
+struct_message myData;
+const char* labels[] = {"FRONT", "BACK", "LEFT", "RIGHT"};
+const int pins[] = {MIC_FRONT, MIC_BACK, MIC_LEFT, MIC_RIGHT};
 
-void buzzTask(void *pvParams) {
-  BuzzParams *p = (BuzzParams *)pvParams;
-  digitalWrite(p->pin, HIGH);
-  vTaskDelay(pdMS_TO_TICKS(BUZZ_MS));
-  digitalWrite(p->pin, LOW);
-  delete p;
-  vTaskDelete(NULL);
+int getPeakToPeak(int pin) {
+    int maxVal = 0;
+    int minVal = 4095;
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        int read = analogRead(pin);
+        if (read > maxVal) maxVal = read;
+        if (read < minVal) minVal = read;
+        delayMicroseconds(SAMPLE_WINDOW);
+    }
+    return maxVal - minVal;
 }
 
-// ── ESP-NOW receive callback ──────────────────────────────────────────────────
-void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  if (len != 1) return;
-
-  uint8_t direction = data[0];
-  if (direction > 3) return;
-
-  Serial.print("Received → ");
-  Serial.println(dirNames[direction]);
-
-  // Stop all motors first (safety — shouldn't be needed, but clean)
-  for (int i = 0; i < 4; i++) {
-    digitalWrite(motorPins[i], LOW);
-  }
-
-  // Spin up buzz on a task so callback returns immediately
-  BuzzParams *p = new BuzzParams{motorPins[direction]};
-  xTaskCreate(buzzTask, "buzz", 1024, p, 1, NULL);
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("Status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
 
-  pinMode(MOTOR_FRONT, OUTPUT);
-  pinMode(MOTOR_RIGHT, OUTPUT);
-  pinMode(MOTOR_BACK,  OUTPUT);
-  pinMode(MOTOR_LEFT,  OUTPUT);
+    // Print Pinout for verification
+    Serial.println("\n--- COCHLEA CAP SENDER INITIALIZED ---");
+    Serial.println("PINOUT CONFIGURATION:");
+    Serial.println("FRONT Mic -> GPIO 34");
+    Serial.println("BACK  Mic -> GPIO 35");
+    Serial.println("LEFT  Mic -> GPIO 32");
+    Serial.println("RIGHT Mic -> GPIO 33");
+    Serial.println("---------------------------------------");
 
-  // All motors off at boot
-  digitalWrite(MOTOR_FRONT, LOW);
-  digitalWrite(MOTOR_RIGHT, LOW);
-  digitalWrite(MOTOR_BACK,  LOW);
-  digitalWrite(MOTOR_LEFT,  LOW);
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Init Failed");
+        return;
+    }
 
-  WiFi.mode(WIFI_STA);
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
-    return;
-  }
-
-  esp_now_register_recv_cb(onReceive);
-
-  Serial.println("Cochlea Cap receiver ready.");
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
+    esp_now_register_send_cb(onDataSent);
+    
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, receiverAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer");
+        return;
+    }
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────────
 void loop() {
-  // Nothing to do — all work happens in the ESP-NOW callback + buzz task
-  delay(100);
+    int amplitudes[4];
+    int loudestVal = 0;
+    int directionIndex = -1;
+
+    // Scan all 4 microphones
+    for (int i = 0; i < 4; i++) {
+        amplitudes[i] = getPeakToPeak(pins[i]);
+        if (amplitudes[i] > loudestVal) {
+            loudestVal = amplitudes[i];
+            directionIndex = i;
+        }
+    }
+
+    // Print levels for tuning
+    Serial.printf("F:%d B:%d L:%d R:%d\n", amplitudes[0], amplitudes[1], amplitudes[2], amplitudes[3]);
+
+    // Check if loudest sound crosses threshold
+    if (loudestVal > THRESHOLD) {
+        Serial.print(">>> TRIGGER: ");
+        Serial.println(labels[directionIndex]);
+
+        myData.direction = directionIndex;
+        esp_now_send(receiverAddress, (uint8_t *) &myData, sizeof(myData));
+        
+        delay(LOCKOUT_TIME); 
+    }
+    delay(10);
 }
